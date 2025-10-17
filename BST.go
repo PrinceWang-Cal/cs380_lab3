@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
+	"reflect"
 	"sort"
 	"strings"
 	"strconv"
@@ -106,18 +107,19 @@ func ParseInputFile(filename string) ([]*BST, error) {
 			continue
 		}
 	
-		// TODO: Parse space-separated integers from line
-		// TODO: Create BST and insert values in order
-		// TODO: Set BST ID to the line index
-		bsts[id] = &BST{ID: id}
+		// Parse space-separated integers from line
+		// Create BST and insert values in order
+		// Set BST ID to the line index
+		bst := &BST{ID: id}
 		values := strings.Split(line, " ")
 		for _, value := range values {
 			intValue, err := strconv.Atoi(value)
 			if err != nil {
 				return nil, err
 			}
-			bsts[id].Root = bsts[id].Root.Insert(intValue)
+			bst.Root = bst.Root.Insert(intValue)
 		}
+		bsts = append(bsts, bst)
 	}
 	
 	return bsts, nil
@@ -211,21 +213,64 @@ func BuildHashGroupsMutex(bsts []*BST, numWorkers int) map[int][]int {
 
 // CompareTreesSequential compares trees with matching hashes sequentially
 func CompareTreesSequential(bsts []*BST, hashGroups map[int][]int) [][]int {
-	// TODO: For each hash group with multiple trees, compare all pairs
-	// TODO: Build equivalence groups (groups of trees that are identical)
-	// TODO: Use a 2D adjacency matrix or other structure to track equivalence
-	// TODO: Return list of equivalence groups (each group is a list of tree IDs)
-	var equivalenceGroups [][]int
+	n := len(bsts)
+	
+	// Create adjacency matrix to track equivalence
+	adjMatrix := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		adjMatrix[i] = make([]bool, n)
+		adjMatrix[i][i] = true // Tree is equivalent to itself
+	}
+	
+	// Compare all pairs of trees with the same hash
 	for _, hashGroup := range hashGroups {
 		if len(hashGroup) > 1 {
 			for i := 0; i < len(hashGroup); i++ {
 				for j := i + 1; j < len(hashGroup); j++ {
-					if AreEqual(bsts[hashGroup[i]], bsts[hashGroup[j]]) {
-						equivalenceGroups = append(equivalenceGroups, []int{hashGroup[i], hashGroup[j]})
+					id1 := hashGroup[i]
+					id2 := hashGroup[j]
+					if AreEqual(bsts[id1], bsts[id2]) {
+						// Mark as equivalent (symmetrically)
+						adjMatrix[id1][id2] = true
+						adjMatrix[id2][id1] = true
 					}
 				}
 			}
 		}
+	}
+	
+	// Build connected components from adjacency matrix
+	visited := make([]bool, n)
+	var equivalenceGroups [][]int
+	
+	for i := 0; i < n; i++ {
+		if !visited[i] {
+			// Start a new group with BFS/DFS
+			group := []int{}
+			queue := []int{i}
+			visited[i] = true
+			
+			for len(queue) > 0 {
+				current := queue[0]
+				queue = queue[1:]
+				group = append(group, current)
+				
+				// Find all trees equivalent to current
+				for j := 0; j < n; j++ {
+					if adjMatrix[current][j] && !visited[j] {
+						visited[j] = true
+						queue = append(queue, j)
+					}
+				}
+			}
+			
+			// Only add groups with more than 1 tree
+			if len(group) > 1 {
+				equivalenceGroups = append(equivalenceGroups, group)
+			}
+		}
+	}
+	
 	return equivalenceGroups
 }
 
