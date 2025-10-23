@@ -140,19 +140,88 @@ func ComputeHashesSequential(bsts []*BST) map[int]int {
 	return hashes
 }
 
-// ComputeHashesParallel computes hashes using multiple goroutines
-func ComputeHashesParallel(bsts []*BST, numWorkers int) map[int]int {
-	// TODO: Implement parallel hash computation
-	// TODO: Create numWorkers goroutines
-	// TODO: Divide BSTs among workers
-	// TODO: Use sync.WaitGroup to wait for all goroutines
-	// TODO: Store results in a thread-safe manner
-	
+// ComputeHashesParallelPerBST spawns one goroutine per BST
+func ComputeHashesParallelPerBST(bsts []*BST) map[int]int {
 	hashes := make(map[int]int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	
-	// Hint: You might want to use a mutex or channels here
+	// Spawn a goroutine for each BST
+	for _, bst := range bsts {
+		wg.Add(1)
+		go func(b *BST) {
+			defer wg.Done()
+			hash := b.ComputeHash()
+			
+			// Safely store result
+			mu.Lock()
+			hashes[b.ID] = hash
+			mu.Unlock()
+		}(bst)
+	}
 	
+	wg.Wait()
 	return hashes
+}
+
+// ComputeHashesParallelWorkerPool uses fixed number of worker goroutines
+func ComputeHashesParallelWorkerPool(bsts []*BST, numWorkers int) map[int]int {
+	hashes := make(map[int]int)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Calculate work distribution
+	bstsPerWorker := len(bsts) / numWorkers
+	if bstsPerWorker == 0 {
+		bstsPerWorker = 1
+	}
+	
+	// Spawn numWorkers goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		
+		go func(workerID int) {
+			defer wg.Done()
+			
+			// Calculate range for this worker
+			start := workerID * bstsPerWorker
+			end := start + bstsPerWorker
+			
+			// Last worker takes any remainder
+			if workerID == numWorkers-1 {
+				end = len(bsts)
+			}
+			
+			// Make sure we don't go out of bounds
+			if start >= len(bsts) {
+				return
+			}
+			if end > len(bsts) {
+				end = len(bsts)
+			}
+			
+			// Process assigned BSTs
+			for j := start; j < end; j++ {
+				hash := bsts[j].ComputeHash()
+				
+				// Safely store result
+				mu.Lock()
+				hashes[bsts[j].ID] = hash
+				mu.Unlock()
+			}
+		}(i)
+	}
+	
+	wg.Wait()
+	return hashes
+}
+
+// ComputeHashesParallel dispatcher function that chooses strategy
+func ComputeHashesParallel(bsts []*BST, numWorkers int, perBSTStrategy bool) map[int]int {
+	if perBSTStrategy {
+		return ComputeHashesParallelPerBST(bsts)
+	}
+	return ComputeHashesParallelWorkerPool(bsts, numWorkers)
 }
 
 // ====================
@@ -167,43 +236,139 @@ type HashGroup struct {
 
 // BuildHashGroupsSequential builds hash groups in main thread
 func BuildHashGroupsSequential(bsts []*BST) map[int][]int {
-	// TODO: Compute hashes and group BSTs by hash value
-	// TODO: Return map from hash to list of BST IDs
 	hashGroups := make(map[int][]int)
 	for _, bst := range bsts {
-		hashGroups[bst.ComputeHash()] = append(hashGroups[bst.ComputeHash()], bst.ID)
+		hash := bst.ComputeHash()
+		hashGroups[hash] = append(hashGroups[hash], bst.ID)
 	}
 	return hashGroups
 }
 
+// HashResult represents a hash computation result
+type HashResult struct {
+	Hash int
+	ID   int
+}
+
 // BuildHashGroupsChannel builds hash groups using channel-based coordination
 func BuildHashGroupsChannel(bsts []*BST, numHashWorkers int) map[int][]int {
-	// TODO: Spawn numHashWorkers goroutines to compute hashes
-	// TODO: Each worker sends (hash, BST ID) pairs to a channel
-	// TODO: Spawn 1 central manager goroutine to receive from channel and update map
-	// TODO: Use sync.WaitGroup for synchronization
-	
 	hashGroups := make(map[int][]int)
 	
-	// Hint: Create a channel for (hash, id) pairs
-	// type HashResult struct {
-	// 	Hash int
-	// 	ID   int
-	// }
+	// Create channel for hash workers to send results
+	resultChan := make(chan HashResult, numHashWorkers)
+	
+	var wg sync.WaitGroup
+	
+	// Calculate work distribution
+	bstsPerWorker := len(bsts) / numHashWorkers
+	if bstsPerWorker == 0 {
+		bstsPerWorker = 1
+	}
+	
+	// Spawn hash worker goroutines
+	for i := 0; i < numHashWorkers; i++ {
+		wg.Add(1)
+		
+		go func(workerID int) {
+			defer wg.Done()
+			
+			// Calculate range for this worker
+			start := workerID * bstsPerWorker
+			end := start + bstsPerWorker
+			
+			// Last worker takes remainder
+			if workerID == numHashWorkers-1 {
+				end = len(bsts)
+			}
+			
+			// Bounds checking
+			if start >= len(bsts) {
+				return
+			}
+			if end > len(bsts) {
+				end = len(bsts)
+			}
+			
+			// Compute hashes and send to channel
+			for j := start; j < end; j++ {
+				hash := bsts[j].ComputeHash()
+				resultChan <- HashResult{Hash: hash, ID: bsts[j].ID}
+			}
+		}(i)
+	}
+	
+	// Spawn central manager goroutine to collect results
+	done := make(chan bool)
+	go func() {
+		for result := range resultChan {
+			// Only one goroutine modifies the map - no mutex needed!
+			hashGroups[result.Hash] = append(hashGroups[result.Hash], result.ID)
+		}
+		done <- true
+	}()
+	
+	// Wait for all hash workers to finish
+	wg.Wait()
+	
+	// Close channel to signal manager to stop
+	close(resultChan)
+	
+	// Wait for manager to finish processing all results
+	<-done
 	
 	return hashGroups
 }
 
 // BuildHashGroupsMutex builds hash groups using mutex-protected map
 func BuildHashGroupsMutex(bsts []*BST, numWorkers int) map[int][]int {
-	// TODO: Spawn numWorkers goroutines to compute hashes
-	// TODO: Each worker updates the shared map after acquiring mutex
-	// TODO: Use sync.WaitGroup for synchronization
-	
 	hashGroups := make(map[int][]int)
 	var mu sync.Mutex
-	_ = mu // Use the mutex
+	var wg sync.WaitGroup
 	
+	// Calculate work distribution
+	bstsPerWorker := len(bsts) / numWorkers
+	if bstsPerWorker == 0 {
+		bstsPerWorker = 1
+	}
+	
+	// Spawn worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		
+		go func(workerID int) {
+			defer wg.Done()
+			
+			// Calculate range for this worker
+			start := workerID * bstsPerWorker
+			end := start + bstsPerWorker
+			
+			// Last worker takes remainder
+			if workerID == numWorkers-1 {
+				end = len(bsts)
+			}
+			
+			// Bounds checking
+			if start >= len(bsts) {
+				return
+			}
+			if end > len(bsts) {
+				end = len(bsts)
+			}
+			
+			// Process assigned BSTs
+			for j := start; j < end; j++ {
+				hash := bsts[j].ComputeHash()
+				id := bsts[j].ID
+				
+				// Acquire mutex, update map, release mutex
+				mu.Lock()
+				hashGroups[hash] = append(hashGroups[hash], id)
+				mu.Unlock()
+			}
+		}(i)
+	}
+	
+	wg.Wait()
 	return hashGroups
 }
 
@@ -211,41 +376,15 @@ func BuildHashGroupsMutex(bsts []*BST, numWorkers int) map[int][]int {
 // Step 3: Tree Comparison
 // ====================
 
-// CompareTreesSequential compares trees with matching hashes sequentially
-func CompareTreesSequential(bsts []*BST, hashGroups map[int][]int) [][]int {
-	n := len(bsts)
-	
-	// Create adjacency matrix to track equivalence
-	adjMatrix := make([][]bool, n)
-	for i := 0; i < n; i++ {
-		adjMatrix[i] = make([]bool, n)
-		adjMatrix[i][i] = true // Tree is equivalent to itself
-	}
-	
-	// Compare all pairs of trees with the same hash
-	for _, hashGroup := range hashGroups {
-		if len(hashGroup) > 1 {
-			for i := 0; i < len(hashGroup); i++ {
-				for j := i + 1; j < len(hashGroup); j++ {
-					id1 := hashGroup[i]
-					id2 := hashGroup[j]
-					if AreEqual(bsts[id1], bsts[id2]) {
-						// Mark as equivalent (symmetrically)
-						adjMatrix[id1][id2] = true
-						adjMatrix[id2][id1] = true
-					}
-				}
-			}
-		}
-	}
-	
-	// Build connected components from adjacency matrix
+// BuildEquivalenceGroupsFromMatrix builds equivalence groups from adjacency matrix using BFS
+func BuildEquivalenceGroupsFromMatrix(adjMatrix [][]bool) [][]int {
+	n := len(adjMatrix)
 	visited := make([]bool, n)
 	var equivalenceGroups [][]int
 	
 	for i := 0; i < n; i++ {
 		if !visited[i] {
-			// Start a new group with BFS/DFS
+			// Start a new group with BFS
 			group := []int{}
 			queue := []int{i}
 			visited[i] = true
@@ -274,28 +413,152 @@ func CompareTreesSequential(bsts []*BST, hashGroups map[int][]int) [][]int {
 	return equivalenceGroups
 }
 
-// CompareTreesParallelUnbounded spawns a goroutine for each comparison
-func CompareTreesParallelUnbounded(bsts []*BST, hashGroups map[int][]int) [][]int {
-	// TODO: For each pair of trees with same hash, spawn a goroutine to compare
-	// TODO: Use a 2D adjacency matrix or other structure to track equivalence
-	// TODO: Build equivalence groups from comparison results
-	// TODO: Use sync.WaitGroup to wait for all comparisons
+// CompareTreesSequential compares trees with matching hashes sequentially
+// Returns adjacency matrix where adjMatrix[i][j] = true means BST i equals BST j
+func CompareTreesSequential(bsts []*BST, hashGroups map[int][]int) [][]bool {
+	n := len(bsts)
 	
-	var equivalenceGroups [][]int
-	return equivalenceGroups
+	// Create adjacency matrix to track equivalence
+	adjMatrix := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		adjMatrix[i] = make([]bool, n)
+		adjMatrix[i][i] = true // Tree is equivalent to itself
+	}
+	
+	// Compare all pairs of trees with the same hash
+	for _, hashGroup := range hashGroups {
+		if len(hashGroup) > 1 {
+			for i := 0; i < len(hashGroup); i++ {
+				for j := i + 1; j < len(hashGroup); j++ {
+					id1 := hashGroup[i]
+					id2 := hashGroup[j]
+					if AreEqual(bsts[id1], bsts[id2]) {
+						// Mark as equivalent (symmetrically)
+						adjMatrix[id1][id2] = true
+						adjMatrix[id2][id1] = true
+					}
+				}
+			}
+		}
+	}
+	
+	return adjMatrix
+}
+
+// CompareTreesParallelUnbounded spawns a goroutine for each comparison
+// Returns adjacency matrix where adjMatrix[i][j] = true means BST i equals BST j
+func CompareTreesParallelUnbounded(bsts []*BST, hashGroups map[int][]int) [][]bool {
+	n := len(bsts)
+	
+	// Create adjacency matrix to track equivalence
+	adjMatrix := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		adjMatrix[i] = make([]bool, n)
+		adjMatrix[i][i] = true // Tree is equivalent to itself
+	}
+	
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Spawn a goroutine for each pair comparison
+	for _, hashGroup := range hashGroups {
+		if len(hashGroup) > 1 {
+			// Compare all pairs within this hash group
+			for i := 0; i < len(hashGroup); i++ {
+				for j := i + 1; j < len(hashGroup); j++ {
+					wg.Add(1)
+					
+					// Spawn goroutine for this comparison
+					go func(id1, id2 int) {
+						defer wg.Done()
+						
+						if AreEqual(bsts[id1], bsts[id2]) {
+							// Mark as equivalent (symmetrically)
+							mu.Lock()
+							adjMatrix[id1][id2] = true
+							adjMatrix[id2][id1] = true
+							mu.Unlock()
+						}
+					}(hashGroup[i], hashGroup[j])
+				}
+			}
+		}
+	}
+	
+	// Wait for all comparisons to complete
+	wg.Wait()
+	
+	return adjMatrix
+}
+
+// ComparisonWork represents a pair of BSTs to compare
+type ComparisonWork struct {
+	ID1 int
+	ID2 int
 }
 
 // CompareTreesParallelPool uses a fixed pool of worker goroutines
-func CompareTreesParallelPool(bsts []*BST, hashGroups map[int][]int, numWorkers int) [][]int {
-	// TODO: Create a concurrent buffer (channel) for work items
-	// TODO: Work item = (BST ID 1, BST ID 2) pair to compare
-	// TODO: Spawn numWorkers goroutines to process work from channel
-	// TODO: Main thread adds work items to channel
-	// TODO: Workers update adjacency matrix when trees match
-	// TODO: Build equivalence groups from adjacency matrix
+// Returns adjacency matrix where adjMatrix[i][j] = true means BST i equals BST j
+func CompareTreesParallelPool(bsts []*BST, hashGroups map[int][]int, numWorkers int) [][]bool {
+	n := len(bsts)
 	
-	var equivalenceGroups [][]int
-	return equivalenceGroups
+	// Create adjacency matrix to track equivalence
+	adjMatrix := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		adjMatrix[i] = make([]bool, n)
+		adjMatrix[i][i] = true // Tree is equivalent to itself
+	}
+	
+	// Create buffered channel for work items (bounded buffer)
+	// Buffer size = numWorkers to limit concurrent work
+	workChan := make(chan ComparisonWork, numWorkers)
+	
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	
+	// Spawn worker goroutines
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			
+			// Process work items from channel
+			for work := range workChan {
+				// Compare the two trees
+				if AreEqual(bsts[work.ID1], bsts[work.ID2]) {
+					// Mark as equivalent (symmetrically)
+					mu.Lock()
+					adjMatrix[work.ID1][work.ID2] = true
+					adjMatrix[work.ID2][work.ID1] = true
+					mu.Unlock()
+				}
+			}
+		}(i)
+	}
+	
+	// Main thread: enqueue all comparison work
+	for _, hashGroup := range hashGroups {
+		if len(hashGroup) > 1 {
+			// Generate all pairs within this hash group
+			for i := 0; i < len(hashGroup); i++ {
+				for j := i + 1; j < len(hashGroup); j++ {
+					// Send work to channel (blocks if buffer full)
+					workChan <- ComparisonWork{
+						ID1: hashGroup[i],
+						ID2: hashGroup[j],
+					}
+				}
+			}
+		}
+	}
+	
+	// Close channel to signal no more work
+	close(workChan)
+	
+	// Wait for all workers to finish
+	wg.Wait()
+	
+	return adjMatrix
 }
 
 // ====================
@@ -371,6 +634,8 @@ func main() {
 	dataWorkersPtr := flag.Int("data-workers", 0, "number of data workers")
 	compWorkersPtr := flag.Int("comp-workers", 0, "number of comparison workers")
 	inputFilePtr := flag.String("input", "", "path to input file")
+	hashStrategyPtr := flag.String("hash-strategy", "pool", "hash strategy: 'perbst' (one goroutine per BST) or 'pool' (worker pool)")
+	compStrategyPtr := flag.String("comp-strategy", "pool", "comparison strategy: 'unbounded' (goroutine per comparison) or 'pool' (worker pool)")
 	
 	flag.Parse()
 	
@@ -378,6 +643,8 @@ func main() {
 	dataWorkers := *dataWorkersPtr
 	compWorkers := *compWorkersPtr
 	inputFile := *inputFilePtr
+	hashStrategy := *hashStrategyPtr
+	compStrategy := *compStrategyPtr
 	
 	if inputFile == "" {
 		fmt.Println("Error: -input flag is required")
@@ -401,7 +668,8 @@ func main() {
 		if hashWorkers == 1 {
 			_ = ComputeHashesSequential(bsts)
 		} else {
-			_ = ComputeHashesParallel(bsts, hashWorkers)
+			perBSTStrategy := (hashStrategy == "perbst")
+			_ = ComputeHashesParallel(bsts, hashWorkers, perBSTStrategy)
 		}
 		
 		elapsed := time.Since(start)
@@ -459,19 +727,25 @@ func main() {
 		
 		hashGroupElapsed := time.Since(hashGroupStart)
 		
-		// Then, compare trees
+		// Then, compare trees and populate adjacency matrix (TIMED)
 		compareStart := time.Now()
-		var equivalenceGroups [][]int
+		var adjMatrix [][]bool
 		
 		if compWorkers == 1 {
 			// Sequential tree comparison
-			equivalenceGroups = CompareTreesSequential(bsts, hashGroups)
+			adjMatrix = CompareTreesSequential(bsts, hashGroups)
+		} else if compStrategy == "unbounded" {
+			// Parallel tree comparison: goroutine per comparison
+			adjMatrix = CompareTreesParallelUnbounded(bsts, hashGroups)
 		} else {
 			// Parallel tree comparison with worker pool
-			equivalenceGroups = CompareTreesParallelPool(bsts, hashGroups, compWorkers)
+			adjMatrix = CompareTreesParallelPool(bsts, hashGroups, compWorkers)
 		}
 		
 		compareElapsed := time.Since(compareStart)
+		
+		// Build equivalence groups from adjacency matrix (NOT TIMED)
+		equivalenceGroups := BuildEquivalenceGroupsFromMatrix(adjMatrix)
 		
 		// Output results
 		PrintHashGroupTime(hashGroupElapsed)
